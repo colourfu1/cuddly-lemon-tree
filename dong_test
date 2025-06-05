@@ -1,0 +1,66 @@
+import os
+import numpy as np
+
+# 文件夹路径
+detected_folder = 'detected_points'
+manual_folder = 'manual_points'
+
+# 设定距离阈值
+distance_threshold = 60
+
+# 获取所有文件名（假设两个文件夹中文件名一致）
+detected_files = sorted(os.listdir(detected_folder))
+manual_files = sorted(os.listdir(manual_folder))
+
+# 确保文件一一对应
+assert detected_files == manual_files, "检测文件和标注文件不匹配！"
+
+# 统计满足条件的检测点数
+total_detected_points = 0
+points_within_threshold = 0
+
+for filename in detected_files:
+    detected_path = os.path.join(detected_folder, filename)
+    manual_path = os.path.join(manual_folder, filename)
+    
+    # 读取检测点
+    with open(detected_path, 'r') as f:
+        detected_lines = f.read().strip().splitlines()
+        detected_points = []
+        for line in detected_lines:
+            if line.strip():
+                x, y = map(float, line.replace(',', ' ').split())
+                detected_points.append([x, y])
+        detected_points = np.array(detected_points)
+    
+    # 读取标注点
+    with open(manual_path, 'r') as f:
+        manual_lines = f.read().strip().splitlines()
+        manual_points = []
+        for line in manual_lines:
+            if line.strip():
+                x, y = map(float, line.replace(',', ' ').split())
+                manual_points.append([x, y])
+        manual_points = np.array(manual_points)
+    
+    # 遍历检测点，计算距离
+    for det_point in detected_points:
+        total_detected_points += 1
+        # 计算与所有标注点的距离
+        distances = np.sqrt(np.sum((manual_points - det_point) ** 2, axis=1))
+        min_distance = np.min(distances)  # 取最近的标注点距离
+        if min_distance < distance_threshold:
+            points_within_threshold += 1
+
+# 计算比例
+if total_detected_points == 0:
+    print("没有检测到任何点！")
+else:
+    proportion = points_within_threshold / total_detected_points
+    print(f"满足距离小于{distance_threshold}像素的检测点比例：{proportion:.2%}")
+
+    # 判断是否达到预期
+    if proportion > 0.5:
+        print("检测效果达到了预期目标！")
+    else:
+        print("检测效果未达预期目标。")
