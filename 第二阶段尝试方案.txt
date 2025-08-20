@@ -1,0 +1,7 @@
+1.替换可变卷积
+https://blog.csdn.net/J_oshua/article/details/137023197
+
+2.更换iou
+https://blog.csdn.net/J_oshua/article/details/136837655
+
+3.dinoV3与yoloV5-7是否能结合
