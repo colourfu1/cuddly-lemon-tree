@@ -24,4 +24,8 @@ https://blog.csdn.net/qq_32575047/article/details/134571685
 8.convnext与yolo结合
 
 https://zhuanlan.zhihu.com/p/576028895
+
 https://blog.51cto.com/u_15953612/7734687
+
+9.基于ODConv＆ConvNeXt的YOLOv5的农场新生小猪监控系统
+https://blog.csdn.net/qunshankeji/article/details/134092873
