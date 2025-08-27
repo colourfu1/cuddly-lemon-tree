@@ -1,0 +1,19 @@
+1.在骨干网络中使用带有 Transformer 结构
+的 C3TR 模块替换原始的 C3 模块(使 用 Transformer 编 码 块 替 换C3 模块中的 Bottleneck 残差块)
+C3TR
+https://blog.51cto.com/u_14439393/5992464
+
+2.再将CA 模块加入 SPPF 层
+https://developer.aliyun.com/article/1431737
+
+3.在 颈 部 网 络 中 ，使 用 ConvNeXtBlock 模
+块替换原有的 C3 模块
+
+4.使用 ECIoU 损失函数替换原始的 CIoU
+损失函数
+https://www.cnblogs.com/kn-zheng/p/17084929.html
+https://blog.csdn.net/qq_44231797/article/details/139968828
+https://zhuanlan.zhihu.com/p/703962669
+https://blog.csdn.net/m0_67647321/article/details/139578137
+https://blog.csdn.net/qq_58467323/article/details/145979836
+https://zhuanlan.zhihu.com/p/490377486?utm_id=0
