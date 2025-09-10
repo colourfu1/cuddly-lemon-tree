@@ -1,0 +1,16 @@
+yolov8
+https://blog.csdn.net/varda8899/article/details/147901692
+
+close_mosaic=10
+余弦退火+warmup_epochs=5 lr0=0.01 lrf=0.001
+
+训练策略
+batch=-1 nbs=64 批量自适应
+amp=true 减少显存加速训练
+
+
+
+https://blog.csdn.net/yxk666/article/details/139287522
+
+erasing调成0
+erasing=0
