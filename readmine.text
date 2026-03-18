@@ -1,0 +1,45 @@
+解释文档
+ultralytics已经集成sam3 使用方法参考链接
+https://github.com/ultralytics/ultralytics/pull/22897
+需要下载相关权重来使用sam3
+https://github.com/mlfoundations/open_clip/blob/main/src/open_clip/bpe_simple_vocab_16e6.txt.gz
+https://modelscope.cn/models/facebook/sam3/resolve/master/sam3.pt
+总结
+新增完整的 SAM 3 集成（图像 + 视频、交互式 + 语义化），并更新了文档、新增了构建器和预测器 API——此外还进行了多项底层 SAM/SAM2 重构和质量修复🚀🧩
+
+📊 主要变化
+SAM 3 使用文档全面更新📝
+明确指出SAM 3 权重（sam3.pt）不会自动下载，必须从官方仓库手动获取。
+为文本提示添加BPE 词汇表( )的要求说明。bpe_simple_vocab_16e6.txt.gz
+将“API 预览”示例替换为具体的基于预测器的示例（语义文本提示、示例框、特征重用、视频跟踪）。
+全新 SAM 3 模型构建器模块🏗️
+ultralytics/models/sam/build_sam3.py为以下建筑商 添加：
+语义图像模型（build_sam3_image_model）需要bpe_path
+交互式/视频跟踪模型（build_interactive_sam3）
+新增 SAM 3 预测器和导出功能🎯
+添加和导出：SAM3Predictor，，，SAM3SemanticPredictor。SAM3VideoPredictorSAM3VideoSemanticPredictor
+自动更新SAM模型选择，以路由sam3*.pt到正确的预测器/模型。
+核心预测器 + 步幅控制改进⚙️
+BasePredictor.setup_source()现在接受一个可选stride参数，以便imgsz正确验证 SAM 3（步长 14）等模型。
+SAM 预测器现在self.imgsz一致地使用（而不是self.args.imgsz）并正确设置模型图像大小。
+SAM/SAM2 检查点加载重构📦
+引入了一种_load_checkpoint()在build.py处理扁平检查点和嵌套"model"检查点时共享的方法。
+SAM3 + 注意力/编码器工具已更新🔧
+scaled_dot_product_attention在关键注意力路径中使用 PyTorch （性能/清晰度双赢）。
+在 中添加掩码插值支持MaskDownSampler，在 中添加灵活的自定义注意力模块MemoryAttentionLayer，以及在 utils 中添加新的位置/相对位置助手。
+扩展 API 参考文档📚
+为 SAM 3 内部结构（编码器/解码器/分词器等）添加了许多新的参考页面，并更新了 MkDocs 导航。
+🎯 目标与影响
+使 SAM 3 реально 可在 Ultralytics 中使用✅
+用户可以运行 SAM 3：
+基于文本提示的概念分割（语义预测器 + BPE 词汇表）🧠🔤
+示例/框驱动的概念细分🧰
+视频跟踪（交互式 + 语义式） 🎥🔍
+减少“它不起作用”的设置混乱 ⚠️➡️✅
+明确记录了 SAM 3 需要手动下载重量数据，并且（对于文本）需要单独的 BPE 文件，从而防止出现静默故障。
+更好的 SAM 3 图像尺寸调整正确性📐
+步长感知imgsz处理避免了尺寸错误的预处理，提高了 SAM/SAM2/SAM3 的可靠性。
+更灵活高效的工作流程🏎️
+文档和 API 现在强调功能重用（一次提取，多次查询），这可以显著加快对同一图像的重复查询。
+Ultralytics 中更丰富的 SAM 3 生态系统的基础🧱
+新的构建器、预测器和参考文档为未来的完善铺平了道路（CLI 对等性、更流畅的资产处理、更广泛的示例等）。
