@@ -1,0 +1,43 @@
+1. 预处理阶段
+# 1. YOLO-E-26检测所有火的候选区域
+# 2. 获取每个候选区域的mask
+# 3. 对mask进行后处理（去噪、填充小孔等）
+
+2. 合并阶段
+# 1. 计算所有mask之间的空间关系
+# 2. 根据IoU和空间距离确定合并规则
+# 3. 实现动态规划或贪心算法进行最优合并
+
+3. 后处理阶段
+# 1. 过滤掉过小的合并结果
+# 2. 确保合并后的mask是连续的
+# 3. 生成最终的完整火的边界框
+
+
+关键技术点
+IoU阈值设置
+高IoU：严格合并，避免重复
+低IoU：宽松合并，避免漏检
+空间距离计算
+# 使用欧几里得距离或曼哈顿距离
+def calculate_distance(mask1, mask2):
+    center1 = calculate_center(mask1)
+    center2 = calculate_center(mask2)
+    return np.sqrt((center1[0]-center2[0])**2 + (center1[1]-center2[1])**2)
+形态学操作
+　# 使用形态学操作连接断开的区域
+from skimage.morphology import binary_closing, binary_opening
+
+# 对合并后的mask进行形态学优化
+cleaned_mask = binary_closing(merged_mask, selem=square(3))
+
+优势特点
+不漏检：通过空间连接确保相邻区域被合并
+不重复：通过IoU阈值控制合并范围
+保持精度：掩码提供精确的边界信息
+实时性：相比传统方法计算效率更高
+
+DFS数据集
+FLAME3数据集
+BowfireDataset
+
