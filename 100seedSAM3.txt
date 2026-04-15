@@ -1,0 +1,891 @@
+1. 从 `manual train` 里拿 **100 张**做 `SAM3` 标定集  
+2. 用这 100 张只做 **SAM3 参数搜索/规则校准**  
+3. `train` 剩余样本 **全部用 SAM3 伪标签**  
+4. 训练 `YOLO1` 时，**不再混入任何人工 train 标签**
+5. `val/test` 继续用**人工标注**评估
+
+这个设计是对的，而且比“人工标签混训”更能证明你的伪标签流程有效。
+
+下面直接给你一套能落地的代码。为了保证严谨，我按**严格版实验**写：
+
+- `seed100` 只用于调 `SAM3`
+- `seed100` **不进入最终 YOLO1 训练**
+- `YOLO1` 只吃 `rest_train` 的 `SAM3` 标签
+- `manual val/test` 完全不参与调参
+
+---
+
+# 一、目录假设
+
+我先按你之前的路径约定写：
+
+```text
+/root/autodl-tmp/datasets/
+├── images/
+│   ├── train
+│   ├── val
+│   └── test
+└── labels/
+    ├── train
+    ├── val
+    └── test
+```
+
+类别约定：
+
+- `0: fire`
+- `1: smoke`
+
+工作目录：
+
+```text
+/root/autodl-tmp/pseudo_pipeline/
+```
+
+---
+
+# 二、实验流程
+
+你最终跑的是这条链：
+
+```text
+manual train(2700)
+    ├── 抽 100 张 -> seed100（仅用于调 SAM3）
+    └── 剩余 -> rest_train（全部交给 SAM3 打伪标签）
+
+seed100 + gt
+    -> 搜 SAM3 参数
+    -> 得到 best_sam3_config.json
+
+best_sam3_config.json + rest_train
+    -> 生成 pseudo labels
+
+rest_train images + pseudo labels
+    -> 训练 YOLO1
+
+manual val / manual test
+    -> 评估 YOLO1
+```
+
+---
+
+# 三、脚本 1：从 manual train 里抽 100 张 seed
+
+文件名建议：
+
+```bash
+/root/autodl-tmp/pseudo_pipeline/scripts/split_seed_from_manual_train.py
+```
+
+代码如下：
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import json
+import random
+from pathlib import Path
+from collections import defaultdict
+
+IMG_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def read_classes_from_label(label_path: Path):
+    classes = set()
+    if not label_path.exists():
+        return classes
+    for line in label_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        try:
+            cls_id = int(float(parts[0]))
+            classes.add(cls_id)
+        except Exception:
+            continue
+    return classes
+
+
+def bucket_name(classes: set):
+    has_fire = 0 in classes
+    has_smoke = 1 in classes
+    if has_fire and has_smoke:
+        return "both"
+    elif has_fire:
+        return "fire_only"
+    elif has_smoke:
+        return "smoke_only"
+    else:
+        return "background"
+
+
+def list_images(image_dir: Path):
+    return sorted([p for p in image_dir.iterdir() if p.suffix.lower() in IMG_SUFFIXES])
+
+
+def proportional_allocate(bucket_sizes, total_n):
+    total = sum(bucket_sizes.values())
+    if total == 0:
+        return {k: 0 for k in bucket_sizes}
+
+    raw = {}
+    alloc = {}
+    for k, v in bucket_sizes.items():
+        raw[k] = total_n * v / total
+        alloc[k] = int(raw[k])
+
+    remain = total_n - sum(alloc.values())
+    remainders = sorted(
+        [(raw[k] - alloc[k], k) for k in bucket_sizes.keys()],
+        reverse=True
+    )
+    for _, k in remainders[:remain]:
+        alloc[k] += 1
+
+    for k in alloc:
+        alloc[k] = min(alloc[k], bucket_sizes[k])
+    return alloc
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image-dir", type=str, required=True)
+    parser.add_argument("--label-dir", type=str, required=True)
+    parser.add_argument("--seed-n", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--out-dir", type=str, required=True)
+    args = parser.parse_args()
+
+    rng = random.Random(args.seed)
+    image_dir = Path(args.image_dir)
+    label_dir = Path(args.label_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    buckets = defaultdict(list)
+    all_images = list_images(image_dir)
+
+    for img_path in all_images:
+        label_path = label_dir / f"{img_path.stem}.txt"
+        classes = read_classes_from_label(label_path)
+        b = bucket_name(classes)
+        buckets[b].append(str(img_path.resolve()))
+
+    for k in buckets:
+        rng.shuffle(buckets[k])
+
+    bucket_sizes = {k: len(v) for k, v in buckets.items()}
+    alloc = proportional_allocate(bucket_sizes, args.seed_n)
+
+    seed_list = []
+    for k in ["both", "fire_only", "smoke_only", "background"]:
+        seed_list.extend(buckets[k][:alloc.get(k, 0)])
+
+    seed_set = set(seed_list)
+    rest_list = [str(p.resolve()) for p in all_images if str(p.resolve()) not in seed_set]
+
+    (out_dir / "seed100.txt").write_text("\n".join(seed_list) + "\n", encoding="utf-8")
+    (out_dir / "rest_train.txt").write_text("\n".join(rest_list) + "\n", encoding="utf-8")
+
+    manifest = {
+        "image_dir": str(image_dir.resolve()),
+        "label_dir": str(label_dir.resolve()),
+        "seed_n": len(seed_list),
+        "rest_n": len(rest_list),
+        "bucket_sizes": bucket_sizes,
+        "bucket_alloc": alloc,
+        "seed": args.seed,
+    }
+    (out_dir / "split_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python /root/autodl-tmp/pseudo_pipeline/scripts/split_seed_from_manual_train.py \
+  --image-dir /root/autodl-tmp/datasets/images/train \
+  --label-dir /root/autodl-tmp/datasets/labels/train \
+  --seed-n 100 \
+  --seed 42 \
+  --out-dir /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100
+```
+
+输出会有：
+
+```text
+/root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/seed100.txt
+/root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/rest_train.txt
+/root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/split_manifest.json
+```
+
+---
+
+# 四、脚本 2：评估 SAM3 伪标签和人工标签的一致性
+
+这个脚本用来在 `seed100` 上比较：
+
+- `SAM3` 生成的标签
+- 人工真值标签
+
+文件名建议：
+
+```bash
+/root/autodl-tmp/pseudo_pipeline/scripts/evaluate_pseudo_vs_gt.py
+```
+
+代码如下：
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import json
+from pathlib import Path
+from PIL import Image
+
+CLASS_NAMES = {0: "fire", 1: "smoke"}
+
+
+def yolo_to_xyxy(xc, yc, w, h, img_w, img_h):
+    x1 = (xc - w / 2.0) * img_w
+    y1 = (yc - h / 2.0) * img_h
+    x2 = (xc + w / 2.0) * img_w
+    y2 = (yc + h / 2.0) * img_h
+    return [x1, y1, x2, y2]
+
+
+def load_yolo_boxes(label_path: Path, img_w: int, img_h: int):
+    boxes = []
+    if not label_path.exists():
+        return boxes
+    for line in label_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        cls_id = int(float(parts[0]))
+        xc, yc, w, h = map(float, parts[1:5])
+        boxes.append({
+            "cls": cls_id,
+            "box": yolo_to_xyxy(xc, yc, w, h, img_w, img_h)
+        })
+    return boxes
+
+
+def iou_xyxy(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def match_class(pred_boxes, gt_boxes, iou_thr=0.5):
+    pairs = []
+    for pi, p in enumerate(pred_boxes):
+        for gi, g in enumerate(gt_boxes):
+            iou = iou_xyxy(p["box"], g["box"])
+            if iou >= iou_thr:
+                pairs.append((iou, pi, gi))
+    pairs.sort(reverse=True)
+
+    used_p = set()
+    used_g = set()
+    tp = 0
+    for iou, pi, gi in pairs:
+        if pi in used_p or gi in used_g:
+            continue
+        used_p.add(pi)
+        used_g.add(gi)
+        tp += 1
+
+    fp = len(pred_boxes) - tp
+    fn = len(gt_boxes) - tp
+    return tp, fp, fn
+
+
+def safe_div(a, b):
+    return a / b if b > 0 else 0.0
+
+
+def f1(p, r):
+    return 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image-list", type=str, required=True)
+    parser.add_argument("--gt-label-dir", type=str, required=True)
+    parser.add_argument("--pred-label-dir", type=str, required=True)
+    parser.add_argument("--iou", type=float, default=0.5)
+    parser.add_argument("--out-json", type=str, required=True)
+    args = parser.parse_args()
+
+    image_list = [Path(x.strip()) for x in Path(args.image_list).read_text(encoding="utf-8").splitlines() if x.strip()]
+    gt_label_dir = Path(args.gt_label_dir)
+    pred_label_dir = Path(args.pred_label_dir)
+
+    stats = {
+        0: {"tp": 0, "fp": 0, "fn": 0},
+        1: {"tp": 0, "fp": 0, "fn": 0},
+    }
+
+    for img_path in image_list:
+        with Image.open(img_path) as im:
+            img_w, img_h = im.size
+
+        gt_path = gt_label_dir / f"{img_path.stem}.txt"
+        pred_path = pred_label_dir / f"{img_path.stem}.txt"
+
+        gt_boxes = load_yolo_boxes(gt_path, img_w, img_h)
+        pred_boxes = load_yolo_boxes(pred_path, img_w, img_h)
+
+        for cls_id in [0, 1]:
+            gt_cls = [b for b in gt_boxes if b["cls"] == cls_id]
+            pred_cls = [b for b in pred_boxes if b["cls"] == cls_id]
+            tp, fp, fn = match_class(pred_cls, gt_cls, iou_thr=args.iou)
+            stats[cls_id]["tp"] += tp
+            stats[cls_id]["fp"] += fp
+            stats[cls_id]["fn"] += fn
+
+    result = {"per_class": {}, "score": 0.0}
+    for cls_id in [0, 1]:
+        tp = stats[cls_id]["tp"]
+        fp = stats[cls_id]["fp"]
+        fn_ = stats[cls_id]["fn"]
+        p = safe_div(tp, tp + fp)
+        r = safe_div(tp, tp + fn_)
+        f = f1(p, r)
+        result["per_class"][CLASS_NAMES[cls_id]] = {
+            "tp": tp,
+            "fp": fp,
+            "fn": fn_,
+            "precision": p,
+            "recall": r,
+            "f1": f,
+        }
+
+    fire_f1 = result["per_class"]["fire"]["f1"]
+    smoke_f1 = result["per_class"]["smoke"]["f1"]
+    result["score"] = 0.7 * fire_f1 + 0.3 * smoke_f1
+
+    out_json = Path(args.out_json)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+这个分数是：
+
+```text
+score = 0.7 * F1_fire + 0.3 * F1_smoke
+```
+
+因为你前面真正最关心的是 `fire`。
+
+---
+
+# 五、你现有 SAM3 脚本需要加一个最小 CLI 接口
+
+你已经有：
+
+```bash
+sam3_generation_3gptnew.py
+```
+
+为了能自动调参，你至少要让它支持这几个参数：
+
+- `--input-list`
+- `--output-label-dir`
+- `--runtime-config`
+
+也就是：  
+给它一份图片列表、一个输出目录、一个参数 json，它就跑这批图并输出 yolo txt。
+
+你不需要推翻原脚本，只要给它加一个入口层。
+
+下面是**最小接口形式**，你加到现有 `sam3_generation_3gptnew.py` 里：
+
+```python
+# ===== 加到 sam3_generation_3gptnew.py 顶部附近 =====
+import argparse
+import json
+from pathlib import Path
+
+def parse_cli():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-list", type=str, required=True, help="一行一个图片绝对路径")
+    parser.add_argument("--output-label-dir", type=str, required=True)
+    parser.add_argument("--runtime-config", type=str, required=True, help="json 配置文件")
+    return parser.parse_args()
+```
+
+然后在主程序里读：
+
+```python
+args = parse_cli()
+runtime_cfg = json.loads(Path(args.runtime_config).read_text(encoding="utf-8"))
+
+# 你原来的各种参数，用 runtime_cfg 覆盖
+# 下面是示意名，替换成你脚本里的真实变量
+FIRE_CONF = runtime_cfg.get("fire_conf", 0.20)
+SMOKE_CONF = runtime_cfg.get("smoke_conf", 0.20)
+FIRE_MIN_AREA = runtime_cfg.get("fire_min_area", 100)
+SMOKE_MIN_AREA = runtime_cfg.get("smoke_min_area", 120)
+NMS_IOU = runtime_cfg.get("nms_iou", 0.50)
+IOF_THR = runtime_cfg.get("iof_thr", 0.80)
+FIRE_DILATE = runtime_cfg.get("fire_dilate", 5)
+SMOKE_DILATE = runtime_cfg.get("smoke_dilate", 7)
+MAX_BOXES_PER_CLASS = runtime_cfg.get("max_boxes_per_class", 20)
+
+image_paths = [Path(x.strip()) for x in Path(args.input_list).read_text(encoding="utf-8").splitlines() if x.strip()]
+output_label_dir = Path(args.output_label_dir)
+output_label_dir.mkdir(parents=True, exist_ok=True)
+```
+
+你的每张图最终都要输出到：
+
+```python
+output_label_dir / f"{img_path.stem}.txt"
+```
+
+内容就是普通 YOLO txt：
+
+```text
+cls x_center y_center width height
+```
+
+---
+
+# 六、脚本 3：在 seed100 上做 SAM3 参数搜索
+
+文件名建议：
+
+```bash
+/root/autodl-tmp/pseudo_pipeline/scripts/search_sam3_params.py
+```
+
+代码如下：
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import itertools
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+
+def run_cmd(cmd):
+    print("RUN:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def load_json(p: Path):
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sam3-script", type=str, required=True)
+    parser.add_argument("--seed-image-list", type=str, required=True)
+    parser.add_argument("--gt-label-dir", type=str, required=True)
+    parser.add_argument("--work-dir", type=str, required=True)
+    args = parser.parse_args()
+
+    work_dir = Path(args.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # 先别搜太大，控制在 16~32 组以内
+    grid = {
+        "fire_conf": [0.15, 0.20],
+        "smoke_conf": [0.15, 0.20],
+        "fire_min_area": [80, 120],
+        "smoke_min_area": [100, 150],
+        "nms_iou": [0.50, 0.60],
+        "iof_thr": [0.75, 0.85],
+        "fire_dilate": [3, 5],
+        "smoke_dilate": [5, 7],
+        "max_boxes_per_class": [20],
+    }
+
+    keys = list(grid.keys())
+    values = [grid[k] for k in keys]
+    combos = list(itertools.product(*values))
+
+    leaderboard = []
+    best = None
+
+    for idx, combo in enumerate(combos):
+        cfg = dict(zip(keys, combo))
+        run_name = f"trial_{idx:03d}"
+        trial_dir = work_dir / run_name
+        label_dir = trial_dir / "labels"
+        score_json = trial_dir / "score.json"
+        cfg_json = trial_dir / "config.json"
+
+        if trial_dir.exists():
+            shutil.rmtree(trial_dir)
+        trial_dir.mkdir(parents=True, exist_ok=True)
+
+        cfg_json.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # 跑 SAM3
+        run_cmd([
+            "python", args.sam3_script,
+            "--input-list", args.seed_image_list,
+            "--output-label-dir", str(label_dir),
+            "--runtime-config", str(cfg_json),
+        ])
+
+        # 评估伪标签 vs gt
+        run_cmd([
+            "python", "/root/autodl-tmp/pseudo_pipeline/scripts/evaluate_pseudo_vs_gt.py",
+            "--image-list", args.seed_image_list,
+            "--gt-label-dir", args.gt_label_dir,
+            "--pred-label-dir", str(label_dir),
+            "--iou", "0.5",
+            "--out-json", str(score_json),
+        ])
+
+        score = load_json(score_json)
+        record = {
+            "run_name": run_name,
+            "config": cfg,
+            "score": score["score"],
+            "fire_f1": score["per_class"]["fire"]["f1"],
+            "smoke_f1": score["per_class"]["smoke"]["f1"],
+        }
+        leaderboard.append(record)
+
+        if best is None or record["score"] > best["score"]:
+            best = record
+
+        print(json.dumps(record, ensure_ascii=False, indent=2))
+
+    leaderboard = sorted(leaderboard, key=lambda x: x["score"], reverse=True)
+
+    (work_dir / "leaderboard.json").write_text(
+        json.dumps(leaderboard, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    (work_dir / "best_sam3_config.json").write_text(
+        json.dumps(best, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    print("\nBEST CONFIG:")
+    print(json.dumps(best, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python /root/autodl-tmp/pseudo_pipeline/scripts/search_sam3_params.py \
+  --sam3-script /root/autodl-tmp/sam3_generation_3gptnew.py \
+  --seed-image-list /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/seed100.txt \
+  --gt-label-dir /root/autodl-tmp/datasets/labels/train \
+  --work-dir /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/search_runs
+```
+
+最后你会拿到：
+
+```text
+/root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/search_runs/best_sam3_config.json
+```
+
+---
+
+# 七、脚本 4：用最优参数给 rest_train 全量打伪标签
+
+文件名建议：
+
+```bash
+/root/autodl-tmp/pseudo_pipeline/scripts/generate_rest_pseudo_labels.sh
+```
+
+内容：
+
+```bash
+#!/usr/bin/env bash
+set -e
+
+SAM3_SCRIPT=/root/autodl-tmp/sam3_generation_3gptnew.py
+REST_LIST=/root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/rest_train.txt
+BEST_CFG=/root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/search_runs/best_sam3_config.json
+OUT_LABEL_DIR=/root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/rest_pseudo_labels
+
+mkdir -p ${OUT_LABEL_DIR}
+
+python ${SAM3_SCRIPT} \
+  --input-list ${REST_LIST} \
+  --output-label-dir ${OUT_LABEL_DIR} \
+  --runtime-config ${BEST_CFG}
+```
+
+运行：
+
+```bash
+bash /root/autodl-tmp/pseudo_pipeline/scripts/generate_rest_pseudo_labels.sh
+```
+
+---
+
+# 八、脚本 5：构建“纯伪标签训练集”
+
+这一步是关键。  
+因为你要证明伪标签流程好，所以 `YOLO1` 的 `train` 只能用：
+
+- `rest_train` 的图
+- `SAM3` 给 `rest_train` 生成的伪标签
+
+**seed100 不进 train。**
+
+文件名建议：
+
+```bash
+/root/autodl-tmp/pseudo_pipeline/scripts/build_pseudo_only_dataset.py
+```
+
+代码如下：
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+from pathlib import Path
+import os
+
+IMG_SUFFIXES = [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
+
+
+def safe_symlink(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    os.symlink(src, dst)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rest-image-list", type=str, required=True)
+    parser.add_argument("--pseudo-label-dir", type=str, required=True)
+    parser.add_argument("--manual-val-image-dir", type=str, required=True)
+    parser.add_argument("--manual-val-label-dir", type=str, required=True)
+    parser.add_argument("--manual-test-image-dir", type=str, default="")
+    parser.add_argument("--manual-test-label-dir", type=str, default="")
+    parser.add_argument("--out-root", type=str, required=True)
+    args = parser.parse_args()
+
+    rest_list = [Path(x.strip()) for x in Path(args.rest_image_list).read_text(encoding="utf-8").splitlines() if x.strip()]
+    pseudo_label_dir = Path(args.pseudo_label_dir)
+    out_root = Path(args.out_root)
+
+    train_img_dir = out_root / "images" / "train"
+    train_lab_dir = out_root / "labels" / "train"
+    val_img_dir = out_root / "images" / "val"
+    val_lab_dir = out_root / "labels" / "val"
+    test_img_dir = out_root / "images" / "test"
+    test_lab_dir = out_root / "labels" / "test"
+
+    # 构建 train（纯伪标签）
+    for img_path in rest_list:
+        dst_img = train_img_dir / img_path.name
+        dst_lab = train_lab_dir / f"{img_path.stem}.txt"
+        src_lab = pseudo_label_dir / f"{img_path.stem}.txt"
+
+        if not src_lab.exists():
+            # 没生成到就跳过
+            continue
+
+        safe_symlink(img_path.resolve(), dst_img)
+        safe_symlink(src_lab.resolve(), dst_lab)
+
+    # val 用人工标注
+    for p in Path(args.manual_val_image_dir).iterdir():
+        if p.suffix.lower() in IMG_SUFFIXES:
+            safe_symlink(p.resolve(), val_img_dir / p.name)
+    for p in Path(args.manual_val_label_dir).iterdir():
+        if p.suffix.lower() == ".txt":
+            safe_symlink(p.resolve(), val_lab_dir / p.name)
+
+    # test 可选
+    if args.manual_test_image_dir and args.manual_test_label_dir:
+        for p in Path(args.manual_test_image_dir).iterdir():
+            if p.suffix.lower() in IMG_SUFFIXES:
+                safe_symlink(p.resolve(), test_img_dir / p.name)
+        for p in Path(args.manual_test_label_dir).iterdir():
+            if p.suffix.lower() == ".txt":
+                safe_symlink(p.resolve(), test_lab_dir / p.name)
+
+    yaml_path = out_root / "datap_pseudo_only.yaml"
+    yaml_text = f"""path: {out_root}
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: fire
+  1: smoke
+"""
+    yaml_path.write_text(yaml_text, encoding="utf-8")
+    print(f"saved: {yaml_path}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python /root/autodl-tmp/pseudo_pipeline/scripts/build_pseudo_only_dataset.py \
+  --rest-image-list /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/rest_train.txt \
+  --pseudo-label-dir /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/rest_pseudo_labels \
+  --manual-val-image-dir /root/autodl-tmp/datasets/images/val \
+  --manual-val-label-dir /root/autodl-tmp/datasets/labels/val \
+  --manual-test-image-dir /root/autodl-tmp/datasets/images/test \
+  --manual-test-label-dir /root/autodl-tmp/datasets/labels/test \
+  --out-root /root/autodl-tmp/datasets_yolo1_pseudo_only
+```
+
+---
+
+# 九、训练 YOLO1
+
+现在训练集已经是**严格纯伪标签**了。
+
+你就直接用你现有的 `test_yolo26s.py`：
+
+```bash
+python /root/autodl-tmp/test_yolo26s.py \
+  --model /root/autodl-tmp/ultralytics-main/ultralytics/weights/yolo26s.pt \
+  --data /root/autodl-tmp/datasets_yolo1_pseudo_only/datap_pseudo_only.yaml \
+  --epochs 100 \
+  --batch 16 \
+  --imgsz 640 \
+  --device 0 \
+  --project /root/autodl-tmp/ultralytics-main/ultralytics/runs/fair_compare \
+  --name yolo1_sam3_pseudo_only_seed100 \
+  --use-default \
+  --seed 42 \
+  --workers 8 \
+  --patience 50 \
+  --cache ram \
+  --exist-ok
+```
+
+---
+
+# 十、这个实验口径为什么是干净的
+
+你这个设计能比较有力地证明：
+
+- 只用 `train` 里 100 张人工标注做 `SAM3` 标定
+- 后面训练集的标签几乎全部来自你的伪标签流程
+- `val/test` 是完全独立的人工标注
+
+所以只要最后 `manual val/test` 表现好，你就能比较有底气地说：
+
+**“不是靠人工 train 直接喂出来的，而是这套伪标签流程本身有效。”**
+
+---
+
+# 十一、我建议你额外保留两个结果
+
+为了后面写结论更稳，建议你同时保留：
+
+### 实验 A：严格证明版
+- `seed100` 只调 `SAM3`
+- `rest_train` 全部伪标签
+- `YOLO1 train` 不混人工标签
+
+### 实验 B：上限参考版
+- 同样 `seed100` 调 `SAM3`
+- 但训练时混入 `seed100` 真标签
+
+这样你最后可以展示：
+
+- **严格证明版**：证明你的伪标签流程本身有效
+- **上限参考版**：说明加少量人工后还能再提升多少
+
+但你当前主实验，确实应该先跑**严格证明版**。
+
+---
+
+# 十二、你现在最该先做的命令顺序
+
+先跑这 4 步：
+
+```bash
+# 1) 抽 seed100
+python /root/autodl-tmp/pseudo_pipeline/scripts/split_seed_from_manual_train.py \
+  --image-dir /root/autodl-tmp/datasets/images/train \
+  --label-dir /root/autodl-tmp/datasets/labels/train \
+  --seed-n 100 \
+  --seed 42 \
+  --out-dir /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100
+
+# 2) 在 seed100 上搜 SAM3 参数
+python /root/autodl-tmp/pseudo_pipeline/scripts/search_sam3_params.py \
+  --sam3-script /root/autodl-tmp/sam3_generation_3gptnew.py \
+  --seed-image-list /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/seed100.txt \
+  --gt-label-dir /root/autodl-tmp/datasets/labels/train \
+  --work-dir /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/search_runs
+
+# 3) 用 best config 给 rest_train 打伪标签
+bash /root/autodl-tmp/pseudo_pipeline/scripts/generate_rest_pseudo_labels.sh
+
+# 4) 构建纯伪标签训练集
+python /root/autodl-tmp/pseudo_pipeline/scripts/build_pseudo_only_dataset.py \
+  --rest-image-list /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/rest_train.txt \
+  --pseudo-label-dir /root/autodl-tmp/pseudo_pipeline/exp_strict_seed100/rest_pseudo_labels \
+  --manual-val-image-dir /root/autodl-tmp/datasets/images/val \
+  --manual-val-label-dir /root/autodl-tmp/datasets/labels/val \
+  --manual-test-image-dir /root/autodl-tmp/datasets/images/test \
+  --manual-test-label-dir /root/autodl-tmp/datasets/labels/test \
+  --out-root /root/autodl-tmp/datasets_yolo1_pseudo_only
+```
+
+然后直接训 `YOLO1`。
+
+---
+
+你下一步最值得做的是：**把你现有 `sam3_generation_3gptnew.py` 贴出来，我可以直接帮你改成支持 `--input-list / --runtime-config / --output-label-dir` 的可搜索版本。**
